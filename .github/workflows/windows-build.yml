@@ -1,0 +1,23 @@
+name: Windows Build
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Restore
+        run: dotnet restore SmartRAM/SmartRAM.csproj
+      - name: Compile check
+        run: dotnet build SmartRAM/SmartRAM.csproj -c Release --no-restore
+      - name: Build self-contained EXE
+        run: dotnet publish SmartRAM/SmartRAM.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:DebugType=None -o publish
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SmartRAM-Windows-x64
+          path: publish/*
