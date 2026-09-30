@@ -1,0 +1,24 @@
+name: Windows Installer
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Publish SmartRAM
+        run: dotnet publish SmartRAM/SmartRAM.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Build installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\SmartRAM.iss"'
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SmartRAM-Windows-Installer
+          path: installer-output/*.exe
