@@ -1,0 +1,41 @@
+name: Validate RED RAM Upgrade
+on:
+  push:
+    branches: [ improve-storage-dashboard, dashboard-storage-polish, storage-intelligence ]
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet restore SmartRAM/SmartRAM.csproj
+      - run: dotnet build SmartRAM/SmartRAM.csproj -c Release --no-restore
+      - run: dotnet publish SmartRAM/SmartRAM.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Compile installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\SmartRAM.iss'
+
+      - name: Stage downloadable installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $setup = Get-ChildItem -Path installer-output -File -Filter 'RED-RAM-Setup-*.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $setup) { throw "Compiled RED RAM installer was not found." }
+          Copy-Item $setup.FullName "release\RED-RAM-Setup.exe"
+      - name: Verify staged installer
+        shell: pwsh
+        run: |
+          $installer = Get-Item "release\RED-RAM-Setup.exe" -ErrorAction Stop
+          if ($installer.Length -le 0) { throw "Staged RED RAM installer is empty." }
+          Write-Host "Installer verified: $($installer.FullName) ($($installer.Length) bytes)"
+      - name: Upload RED RAM Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: RED-RAM-Windows-Installer
+          path: release/RED-RAM-Setup.exe
+          if-no-files-found: error
+          retention-days: 7
