@@ -1,14 +1,21 @@
 using System.Diagnostics;
 using System.IO;
 using System.Management;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace SmartRAM;
 
 public enum RecoveryConfidence { Low, Medium, High }
 public record DiskRecoveryAssessment(string Drive,string FileSystem,string VolumeLabel,long Capacity,long Free,bool Accessible,string Health,string Problem,RecoveryConfidence Confidence,string Evidence,string Recommendation,bool CanUseWindowsRepair,bool BitLockerLocked,string PhysicalDisk);
 public record DiskRepairResult(bool Started,string Message);
+public record RawVolumeProbe(bool Opened,string FileSystemHint,string PartitionStyle,string Evidence);
 
 public static class DiskRecoveryEngine {
+ const uint GENERIC_READ=0x80000000,FILE_SHARE_READ=1,FILE_SHARE_WRITE=2,OPEN_EXISTING=3;
+ [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] static extern SafeFileHandle CreateFile(string name,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+ static RawVolumeProbe ProbeRawVolume(string drive,List<string> evidence){try{using var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);if(h.IsInvalid){var msg="Native read-only volume open failed: "+new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message;evidence.Add(msg);return new(false,"Unknown","Unknown",msg);}using var fs=new FileStream(h,FileAccess.Read,4096,false);var b=new byte[4096];int n=fs.Read(b,0,b.Length);string hint="Unknown",style="Unknown";if(n>=512){if(b[510]==0x55&&b[511]==0xAA)style="MBR/boot signature present";var oem=System.Text.Encoding.ASCII.GetString(b,3,Math.Min(8,n-3)).Trim();if(oem.Contains("NTFS",StringComparison.OrdinalIgnoreCase))hint="NTFS";else if(oem.Contains("EXFAT",StringComparison.OrdinalIgnoreCase))hint="exFAT";else if(oem.Contains("FAT",StringComparison.OrdinalIgnoreCase))hint="FAT";evidence.Add($"Native read-only probe: {n} bytes read; filesystem hint {hint}; {style}.");}return new(true,hint,style,string.Join(Environment.NewLine,evidence));}catch(Exception ex){evidence.Add("Native read-only probe failed: "+ex.Message);return new(false,"Unknown","Unknown",ex.Message);}}
+
  public static List<string> CandidateDrives(){
   var drives=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
   foreach(var d in DriveInfo.GetDrives())try{if(d.DriveType is DriveType.Fixed or DriveType.Removable)drives.Add(d.Name[..2]);}catch{}
@@ -40,15 +47,15 @@ public static class DiskRecoveryEngine {
   ct.ThrowIfCancellationRequested();drive=drive.Trim().TrimEnd('\\');if(drive.Length==1)drive+=":";string fs="Unknown",label="";long cap=0,free=0;bool accessible=false;var evidence=new List<string>();
   try{var di=new DriveInfo(drive+"\\");if(di.IsReady){accessible=true;fs=di.DriveFormat;label=di.VolumeLabel;cap=di.TotalSize;free=di.AvailableFreeSpace;evidence.Add("Windows can mount and read the volume.");}else evidence.Add("Windows reports the volume is not ready.");}catch(Exception ex){evidence.Add("Windows cannot mount the volume: "+ex.Message);}
   try{using var q=new ManagementObjectSearcher($"SELECT FileSystem,VolumeName,Size,FreeSpace FROM Win32_LogicalDisk WHERE DeviceID='{drive}'");foreach(ManagementObject d in q.Get()){var reportedFs=$"{d["FileSystem"]}".Trim();if(!string.IsNullOrWhiteSpace(reportedFs))fs=reportedFs;label=$"{d["VolumeName"]}".Trim();long.TryParse($"{d["Size"]}",out cap);long.TryParse($"{d["FreeSpace"]}",out free);}}catch{}
-  ct.ThrowIfCancellationRequested();var mapped=PhysicalDiskFor(drive,evidence);var health=mapped.health;var bitLockerLocked=BitLockerLocked(drive,evidence);ct.ThrowIfCancellationRequested();
+  ct.ThrowIfCancellationRequested();var mapped=PhysicalDiskFor(drive,evidence);var health=mapped.health;var bitLockerLocked=BitLockerLocked(drive,evidence);ct.ThrowIfCancellationRequested();var rawProbe=ProbeRawVolume(drive,evidence);if((string.IsNullOrWhiteSpace(fs)||fs.Equals("Unknown",StringComparison.OrdinalIgnoreCase)||fs.Equals("RAW",StringComparison.OrdinalIgnoreCase))&&rawProbe.FileSystemHint!="Unknown"){fs=rawProbe.FileSystemHint;evidence.Add("Filesystem identified by native read-only signature probe.");}
   var raw=string.IsNullOrWhiteSpace(fs)||fs.Equals("RAW",StringComparison.OrdinalIgnoreCase)||fs.Equals("Unknown",StringComparison.OrdinalIgnoreCase);string problem;RecoveryConfidence confidence;bool repair;
   var unhealthy=!health.Equals("OK",StringComparison.OrdinalIgnoreCase)&&!health.Equals("Unknown",StringComparison.OrdinalIgnoreCase);
   if(unhealthy){problem="Windows reports a warning state for the physical disk containing this volume. Write-based repair is blocked.";confidence=RecoveryConfidence.Low;repair=false;evidence.Add("Hardware warning takes priority over filesystem repair.");}
   else if(bitLockerLocked){problem="The selected volume is BitLocker locked. Repair is blocked until the owner unlocks it with the recovery key or password.";confidence=RecoveryConfidence.High;repair=false;}
   else if(accessible&&!raw){problem="Volume is readable; a non-destructive filesystem scan is appropriate before any repair.";confidence=RecoveryConfidence.High;repair=true;}
-  else if(raw){problem="Filesystem is RAW or unrecognized. SmartRAM will not format it or run write-based CHKDSK automatically.";confidence=health.Equals("OK",StringComparison.OrdinalIgnoreCase)?RecoveryConfidence.Medium:RecoveryConfidence.Low;repair=false;evidence.Add("RAW/unrecognized filesystems require recovery-first handling because filesystem repair may alter metadata.");}
+  else if(raw){problem="Filesystem is RAW or unrecognized. RED RAM will not format it or run blind write-based CHKDSK.";confidence=health.Equals("OK",StringComparison.OrdinalIgnoreCase)?RecoveryConfidence.Medium:RecoveryConfidence.Low;repair=false;evidence.Add(rawProbe.Opened?"Native read-only access succeeded; deeper recovery can proceed without formatting.":"RAW/unrecognized filesystems require recovery-first handling because filesystem repair may alter metadata.");}
   else{problem="Volume is inaccessible or not ready.";confidence=RecoveryConfidence.Low;repair=false;}
-  var rec=unhealthy?"Stop repeated repair attempts and create an image/clone before deeper recovery.":repair?"Run a read-only Windows filesystem scan. If corruption is confirmed, SmartRAM can launch the supported repair step after confirmation.":"Do not format or initialize this drive. Recover or image the source first; write-based repair is blocked by SmartRAM.";
+  var rec=unhealthy?"Stop repeated repair attempts and create an image/clone before deeper recovery.":repair?"Run a read-only Windows filesystem scan. If corruption is confirmed, SmartRAM can launch the supported repair step after confirmation.":"Do not format or initialize this drive. Recover or image the source first; write-based repair is blocked by RED RAM.";
   return new DiskRecoveryAssessment(drive,fs,label,cap,free,accessible,health,problem,confidence,string.Join(Environment.NewLine,evidence),rec,repair,bitLockerLocked,mapped.disk);
  },ct);
  public static async Task<string> ScanFileSystemAsync(string drive,CancellationToken ct){
