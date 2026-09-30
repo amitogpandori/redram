@@ -11,7 +11,7 @@ public record DiskRecoveryAssessment(string Drive,string FileSystem,string Volum
 public record DiskRepairResult(bool Started,string Message);
 public record RawVolumeProbe(bool Opened,string FileSystemHint,string PartitionStyle,string Evidence);
 public record NativeRepairPlan(bool SafeToRepair,long BackupOffset,int SectorSize,string Detail);
-public enum AutoRecoveryAction { None, ReadOnlyScan, RestoreNtfsBoot, NeedsDestination, UnlockBitLocker, ImageFirst }
+public enum AutoRecoveryAction { None, ReadOnlyScan, RestoreNtfsBoot, RestoreNtfsMft, NeedsDestination, UnlockBitLocker, ImageFirst }
 public record AutoRecoveryDecision(AutoRecoveryAction Action,string Reason);
 
 public static class DiskRecoveryEngine {
@@ -56,17 +56,51 @@ public static class DiskRecoveryEngine {
   }catch(Exception ex){return new(false,"Automatic validated repair stopped safely: "+ex.Message);}
  }
 
+ static bool ValidMftRecord(byte[] b,int offset,int size){
+  if(offset<0||size<512||offset+size>b.Length)return false;
+  return b[offset]=='F'&&b[offset+1]=='I'&&b[offset+2]=='L'&&b[offset+3]=='E';
+ }
+ static NativeRepairPlan InspectNtfsMftMirror(string drive,List<string> evidence){
+  try{
+   using var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);
+   if(h.IsInvalid)return new(false,0,0,"Native volume access unavailable.");
+   using var fs=new FileStream(h,FileAccess.Read,4096,false);var boot=new byte[512];if(fs.Read(boot,0,512)!=512||!ValidNtfsBoot(boot))return new(false,0,0,"A valid NTFS boot sector is required before MFT recovery.");
+   int bps=BitConverter.ToUInt16(boot,11),spc=boot[13];long cluster=(long)bps*spc,mftLcn=BitConverter.ToInt64(boot,48),mirrorLcn=BitConverter.ToInt64(boot,56);sbyte r=unchecked((sbyte)boot[64]);
+   int recordSize=r>0?checked((int)(r*cluster)):1<<(-r);if(recordSize<512||recordSize>65536)return new(false,0,0,"NTFS MFT record size is invalid.");
+   int records=4,bytes=checked(recordSize*records);long mft=mftLcn*cluster,mirror=mirrorLcn*cluster;if(mft<0||mirror<0||mft+bytes>fs.Length||mirror+bytes>fs.Length)return new(false,0,0,"MFT locations are outside the volume.");
+   var a=new byte[bytes];var b=new byte[bytes];fs.Position=mft;if(fs.Read(a,0,bytes)!=bytes)return new(false,0,0,"Could not read primary MFT records.");fs.Position=mirror;if(fs.Read(b,0,bytes)!=bytes)return new(false,0,0,"Could not read MFT mirror records.");
+   bool primary=true,backup=true;for(int i=0;i<records;i++){primary&=ValidMftRecord(a,i*recordSize,recordSize);backup&=ValidMftRecord(b,i*recordSize,recordSize);}
+   if(primary){evidence.Add("Primary NTFS MFT system records are structurally readable.");return new(false,0,0,"Primary MFT system records are readable.");}
+   if(backup){evidence.Add($"Primary MFT system records are damaged; validated MFT mirror found at offset {mirror}.");return new(true,mirror,bytes,$"MFT:{mft}:{mirror}:{bytes}");}
+   return new(false,0,0,"Neither the primary MFT system records nor MFT mirror passed structural validation.");
+  }catch(Exception ex){evidence.Add("MFT mirror inspection unavailable: "+ex.Message);return new(false,0,0,ex.Message);}
+ }
+ public static DiskRepairResult AutoRepairValidatedNtfsMft(string drive){
+  var ev=new List<string>();var plan=InspectNtfsMftMirror(drive,ev);if(!plan.SafeToRepair)return new(false,plan.Detail);
+  if(!VirtualMemoryManager.IsAdministrator())return new(false,"Administrator permission is required for validated MFT repair.");
+  try{
+   var parts=plan.Detail.Split(':');if(parts.Length!=4||parts[0]!="MFT")return new(false,"MFT repair plan is invalid.");long target=long.Parse(parts[1]),source=long.Parse(parts[2]);int bytes=int.Parse(parts[3]);byte[] mirror,original;
+   using(var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero)){if(h.IsInvalid)return new(false,"Could not reopen volume.");using var fs=new FileStream(h,FileAccess.Read,4096,false);mirror=new byte[bytes];original=new byte[bytes];fs.Position=source;if(fs.Read(mirror,0,bytes)!=bytes)return new(false,"Could not re-read MFT mirror.");fs.Position=target;if(fs.Read(original,0,bytes)!=bytes)return new(false,"Could not preserve damaged MFT records.");}
+   var dir=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"RED RAM","RecoveryBackups");Directory.CreateDirectory(dir);var path=Path.Combine(dir,$"{drive.Replace(":","")}-mft-{DateTime.Now:yyyyMMdd-HHmmss}.bin");File.WriteAllBytes(path,original);
+   using var wh=CreateFile(@"\\.\\"+drive,GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);if(wh.IsInvalid)return new(false,"Windows did not grant write access. MFT backup was preserved.");
+   using var ws=new FileStream(wh,FileAccess.ReadWrite,4096,false);ws.Position=target;ws.Write(mirror,0,mirror.Length);ws.Flush(true);
+   return new(true,$"Validated NTFS MFT mirror restored to the damaged system-record area. Original MFT bytes saved to {path}. Reconnect the drive and verify it before further writes.");
+  }catch(Exception ex){return new(false,"Validated MFT repair stopped safely: "+ex.Message);}
+ }
+
  public static AutoRecoveryDecision Decide(DiskRecoveryAssessment a){
   if(a.BitLockerLocked)return new(AutoRecoveryAction.UnlockBitLocker,"BitLocker is locked; recovery requires the owner's key/password.");
   if(!a.Health.Equals("OK",StringComparison.OrdinalIgnoreCase)&&!a.Health.Equals("Unknown",StringComparison.OrdinalIgnoreCase))return new(AutoRecoveryAction.ImageFirst,"Disk health warning detected; write repair is unsafe.");
   if(a.Accessible&&a.CanUseWindowsRepair)return new(AutoRecoveryAction.ReadOnlyScan,"Mounted filesystem: verify it read-only before any repair.");
   var ev=new List<string>();var p=InspectNtfsBackup(a.Drive,ev);
   if(p.SafeToRepair)return new(AutoRecoveryAction.RestoreNtfsBoot,p.Detail);
+  var m=InspectNtfsMftMirror(a.Drive,ev);if(m.SafeToRepair)return new(AutoRecoveryAction.RestoreNtfsMft,"Primary MFT system records failed validation while the MFT mirror passed.");
   return new(AutoRecoveryAction.NeedsDestination,"No validated in-place repair is available; preserve the source and recover files to another disk.");
  }
  public static async Task<DiskRepairResult> ExecuteAutomaticAsync(DiskRecoveryAssessment a,CancellationToken ct){
   var d=Decide(a);
   if(d.Action==AutoRecoveryAction.RestoreNtfsBoot)return await Task.Run(()=>AutoRepairValidatedNtfsBoot(a.Drive),ct);
+  if(d.Action==AutoRecoveryAction.RestoreNtfsMft)return await Task.Run(()=>AutoRepairValidatedNtfsMft(a.Drive),ct);
   if(d.Action==AutoRecoveryAction.ReadOnlyScan){var o=await ScanFileSystemAsync(a.Drive,ct);return new(false,"Read-only verification completed.\n\n"+o);}
   if(d.Action==AutoRecoveryAction.ImageFirst)return new(false,"Physical-risk path selected automatically. RED RAM will not write to this disk. Image/clone recovery is required before repair.");
   if(d.Action==AutoRecoveryAction.UnlockBitLocker)return new(false,"BitLocker path selected automatically. Unlock the volume with its recovery key/password; RED RAM will not bypass encryption.");
