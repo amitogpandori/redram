@@ -10,11 +10,49 @@ public enum RecoveryConfidence { Low, Medium, High }
 public record DiskRecoveryAssessment(string Drive,string FileSystem,string VolumeLabel,long Capacity,long Free,bool Accessible,string Health,string Problem,RecoveryConfidence Confidence,string Evidence,string Recommendation,bool CanUseWindowsRepair,bool BitLockerLocked,string PhysicalDisk);
 public record DiskRepairResult(bool Started,string Message);
 public record RawVolumeProbe(bool Opened,string FileSystemHint,string PartitionStyle,string Evidence);
+public record NativeRepairPlan(bool SafeToRepair,long BackupOffset,int SectorSize,string Detail);
 
 public static class DiskRecoveryEngine {
- const uint GENERIC_READ=0x80000000,FILE_SHARE_READ=1,FILE_SHARE_WRITE=2,OPEN_EXISTING=3;
+ const uint GENERIC_READ=0x80000000,GENERIC_WRITE=0x40000000,FILE_SHARE_READ=1,FILE_SHARE_WRITE=2,OPEN_EXISTING=3;
  [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] static extern SafeFileHandle CreateFile(string name,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
  static RawVolumeProbe ProbeRawVolume(string drive,List<string> evidence){try{using var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);if(h.IsInvalid){var msg="Native read-only volume open failed: "+new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message;evidence.Add(msg);return new(false,"Unknown","Unknown",msg);}using var fs=new FileStream(h,FileAccess.Read,4096,false);var b=new byte[4096];int n=fs.Read(b,0,b.Length);string hint="Unknown",style="Unknown";if(n>=512){if(b[510]==0x55&&b[511]==0xAA)style="MBR/boot signature present";var oem=System.Text.Encoding.ASCII.GetString(b,3,Math.Min(8,n-3)).Trim();if(oem.Contains("NTFS",StringComparison.OrdinalIgnoreCase))hint="NTFS";else if(oem.Contains("EXFAT",StringComparison.OrdinalIgnoreCase))hint="exFAT";else if(oem.Contains("FAT",StringComparison.OrdinalIgnoreCase))hint="FAT";evidence.Add($"Native read-only probe: {n} bytes read; filesystem hint {hint}; {style}.");}return new(true,hint,style,string.Join(Environment.NewLine,evidence));}catch(Exception ex){evidence.Add("Native read-only probe failed: "+ex.Message);return new(false,"Unknown","Unknown",ex.Message);}}
+
+ static bool ValidNtfsBoot(byte[] b){
+  if(b.Length<512||System.Text.Encoding.ASCII.GetString(b,3,8)!="NTFS    "||b[510]!=0x55||b[511]!=0xAA)return false;
+  int bps=BitConverter.ToUInt16(b,11),spc=b[13];
+  return bps is 512 or 1024 or 2048 or 4096 && spc>0&&(spc&(spc-1))==0;
+ }
+ static NativeRepairPlan InspectNtfsBackup(string drive,List<string> evidence){
+  try{
+   using var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);
+   if(h.IsInvalid)return new(false,0,0,"Native volume access unavailable.");
+   using var fs=new FileStream(h,FileAccess.Read,4096,false);long len=fs.Length;
+   if(len<4096)return new(false,0,0,"Volume length unavailable or too small.");
+   var primary=new byte[512];fs.Position=0;if(fs.Read(primary,0,512)!=512)return new(false,0,0,"Could not read primary boot sector.");
+   if(ValidNtfsBoot(primary)){evidence.Add("Primary NTFS boot sector is structurally valid.");return new(false,0,512,"Primary NTFS boot sector is valid.");}
+   foreach(var size in new[]{512,4096}){if(len<size)continue;var b=new byte[size];fs.Position=len-size;if(fs.Read(b,0,size)==size&&ValidNtfsBoot(b)){evidence.Add($"Validated NTFS backup boot sector found at offset {len-size}.");return new(true,len-size,size,"Primary NTFS boot sector is invalid but a structurally valid NTFS backup boot sector exists.");}}
+   return new(false,0,0,"No validated NTFS backup boot sector was found.");
+  }catch(Exception ex){evidence.Add("NTFS backup inspection unavailable: "+ex.Message);return new(false,0,0,ex.Message);}
+ }
+ public static DiskRepairResult AutoRepairValidatedNtfsBoot(string drive){
+  var evidence=new List<string>();var plan=InspectNtfsBackup(drive,evidence);if(!plan.SafeToRepair)return new(false,plan.Detail);
+  if(!VirtualMemoryManager.IsAdministrator())return new(false,"Administrator permission is required for validated filesystem repair.");
+  try{
+   byte[] backup,original;
+   using(var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero)){
+    if(h.IsInvalid)return new(false,"Could not open volume read-only.");
+    using var fs=new FileStream(h,FileAccess.Read,4096,false);backup=new byte[plan.SectorSize];original=new byte[plan.SectorSize];
+    fs.Position=plan.BackupOffset;if(fs.Read(backup,0,backup.Length)!=backup.Length||!ValidNtfsBoot(backup))return new(false,"Backup boot sector changed or failed validation.");
+    fs.Position=0;if(fs.Read(original,0,original.Length)!=original.Length)return new(false,"Could not preserve original boot metadata.");
+   }
+   var dir=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"RED RAM","RecoveryBackups");Directory.CreateDirectory(dir);
+   var path=Path.Combine(dir,$"{drive.Replace(":","")}-boot-{DateTime.Now:yyyyMMdd-HHmmss}.bin");File.WriteAllBytes(path,original);
+   using var wh=CreateFile(@"\\.\\"+drive,GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);
+   if(wh.IsInvalid)return new(false,"Windows did not grant write access. Original metadata backup was preserved.");
+   using var ws=new FileStream(wh,FileAccess.ReadWrite,4096,false);ws.Position=0;ws.Write(backup,0,backup.Length);ws.Flush(true);
+   return new(true,$"Validated NTFS backup boot sector restored. Original metadata was saved to {path}. Reconnect the drive so Windows can remount it.");
+  }catch(Exception ex){return new(false,"Automatic validated repair stopped safely: "+ex.Message);}
+ }
 
  public static List<string> CandidateDrives(){
   var drives=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
