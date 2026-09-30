@@ -1,5 +1,5 @@
 #define MyAppName "RED RAM"
-#define MyAppVersion "0.9.0"
+#define MyAppVersion "0.9.1"
 #define MyAppPublisher "RED RAM"
 #define MyAppExeName "RedRAM.exe"
 #define MyAppId "{CDE6B25E-3D9D-4A47-9E72-6F918B7A0D31}"
@@ -33,7 +33,7 @@ Name: "{autodesktop}\RED RAM"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktop
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch SmartRAM"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch RED RAM"; Flags: nowait postinstall skipifsilent
 [Code]
 var PreviousVersion: String;
 function InitializeSetup(): Boolean;
