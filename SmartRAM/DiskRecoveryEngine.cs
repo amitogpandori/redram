@@ -11,6 +11,8 @@ public record DiskRecoveryAssessment(string Drive,string FileSystem,string Volum
 public record DiskRepairResult(bool Started,string Message);
 public record RawVolumeProbe(bool Opened,string FileSystemHint,string PartitionStyle,string Evidence);
 public record NativeRepairPlan(bool SafeToRepair,long BackupOffset,int SectorSize,string Detail);
+public enum AutoRecoveryAction { None, ReadOnlyScan, RestoreNtfsBoot, NeedsDestination, UnlockBitLocker, ImageFirst }
+public record AutoRecoveryDecision(AutoRecoveryAction Action,string Reason);
 
 public static class DiskRecoveryEngine {
  const uint GENERIC_READ=0x80000000,GENERIC_WRITE=0x40000000,FILE_SHARE_READ=1,FILE_SHARE_WRITE=2,OPEN_EXISTING=3;
@@ -54,6 +56,22 @@ public static class DiskRecoveryEngine {
   }catch(Exception ex){return new(false,"Automatic validated repair stopped safely: "+ex.Message);}
  }
 
+ public static AutoRecoveryDecision Decide(DiskRecoveryAssessment a){
+  if(a.BitLockerLocked)return new(AutoRecoveryAction.UnlockBitLocker,"BitLocker is locked; recovery requires the owner's key/password.");
+  if(!a.Health.Equals("OK",StringComparison.OrdinalIgnoreCase)&&!a.Health.Equals("Unknown",StringComparison.OrdinalIgnoreCase))return new(AutoRecoveryAction.ImageFirst,"Disk health warning detected; write repair is unsafe.");
+  if(a.Accessible&&a.CanUseWindowsRepair)return new(AutoRecoveryAction.ReadOnlyScan,"Mounted filesystem: verify it read-only before any repair.");
+  var ev=new List<string>();var p=InspectNtfsBackup(a.Drive,ev);
+  if(p.SafeToRepair)return new(AutoRecoveryAction.RestoreNtfsBoot,p.Detail);
+  return new(AutoRecoveryAction.NeedsDestination,"No validated in-place repair is available; preserve the source and recover files to another disk.");
+ }
+ public static async Task<DiskRepairResult> ExecuteAutomaticAsync(DiskRecoveryAssessment a,CancellationToken ct){
+  var d=Decide(a);
+  if(d.Action==AutoRecoveryAction.RestoreNtfsBoot)return await Task.Run(()=>AutoRepairValidatedNtfsBoot(a.Drive),ct);
+  if(d.Action==AutoRecoveryAction.ReadOnlyScan){var o=await ScanFileSystemAsync(a.Drive,ct);return new(false,"Read-only verification completed.\n\n"+o);}
+  if(d.Action==AutoRecoveryAction.ImageFirst)return new(false,"Physical-risk path selected automatically. RED RAM will not write to this disk. Image/clone recovery is required before repair.");
+  if(d.Action==AutoRecoveryAction.UnlockBitLocker)return new(false,"BitLocker path selected automatically. Unlock the volume with its recovery key/password; RED RAM will not bypass encryption.");
+  return new(false,"Recovery-to-another-drive path selected automatically. No safe in-place repair was proven, so the source remains unchanged.");
+ }
  public static List<string> CandidateDrives(){
   var drives=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
   foreach(var d in DriveInfo.GetDrives())try{if(d.DriveType is DriveType.Fixed or DriveType.Removable)drives.Add(d.Name[..2]);}catch{}
@@ -93,7 +111,7 @@ public static class DiskRecoveryEngine {
   else if(accessible&&!raw){problem="Volume is readable; a non-destructive filesystem scan is appropriate before any repair.";confidence=RecoveryConfidence.High;repair=true;}
   else if(raw){problem="Filesystem is RAW or unrecognized. RED RAM will not format it or run blind write-based CHKDSK.";confidence=health.Equals("OK",StringComparison.OrdinalIgnoreCase)?RecoveryConfidence.Medium:RecoveryConfidence.Low;repair=false;evidence.Add(rawProbe.Opened?"Native read-only access succeeded; deeper recovery can proceed without formatting.":"RAW/unrecognized filesystems require recovery-first handling because filesystem repair may alter metadata.");}
   else{problem="Volume is inaccessible or not ready.";confidence=RecoveryConfidence.Low;repair=false;}
-  var rec=unhealthy?"Stop repeated repair attempts and create an image/clone before deeper recovery.":repair?"Run a read-only Windows filesystem scan. If corruption is confirmed, SmartRAM can launch the supported repair step after confirmation.":"Do not format or initialize this drive. Recover or image the source first; write-based repair is blocked by RED RAM.";
+  var rec=unhealthy?"Stop repeated repair attempts and create an image/clone before deeper recovery.":repair?"Run a read-only Windows filesystem scan. If corruption is confirmed, RED RAM can launch the supported repair step after confirmation.":"Do not format or initialize this drive. Recover or image the source first; write-based repair is blocked by RED RAM.";
   return new DiskRecoveryAssessment(drive,fs,label,cap,free,accessible,health,problem,confidence,string.Join(Environment.NewLine,evidence),rec,repair,bitLockerLocked,mapped.disk);
  },ct);
  public static async Task<string> ScanFileSystemAsync(string drive,CancellationToken ct){
