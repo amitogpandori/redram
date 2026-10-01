@@ -1,6 +1,7 @@
 using System.Windows;
 namespace SmartRAM;
 using System.Text;
+using System.IO;
 public partial class DiskRecoveryWindow:Window{
  CancellationTokenSource? cts;DiskRecoveryAssessment? assessment;
  public DiskRecoveryWindow(){InitializeComponent();DriveBox.ItemsSource=DiskRecoveryEngine.CandidateDrives();if(DriveBox.Items.Count>0)DriveBox.SelectedIndex=0;}
