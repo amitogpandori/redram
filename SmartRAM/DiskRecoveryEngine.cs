@@ -2,6 +2,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Management;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text.Json;
 using Microsoft.Win32.SafeHandles;
 
 namespace SmartRAM;
@@ -13,10 +15,34 @@ public record RawVolumeProbe(bool Opened,string FileSystemHint,string PartitionS
 public record NativeRepairPlan(bool SafeToRepair,long BackupOffset,int SectorSize,string Detail);
 public enum AutoRecoveryAction { None, ReadOnlyScan, RestoreNtfsBoot, RestoreNtfsMft, NeedsDestination, UnlockBitLocker, ImageFirst }
 public record AutoRecoveryDecision(AutoRecoveryAction Action,string Reason);
+public record PartitionCandidate(string FileSystem,long Offset,long Size,RecoveryConfidence Confidence,string Evidence);
+public record RecoveryProgress(long BytesProcessed,long TotalBytes,int ReadErrors,string Stage);
+public record RecoveryJournalEntry(DateTime Timestamp,string Drive,long Offset,int Length,string OriginalSha256,string ReplacementSha256,string Operation,string BackupPath);
+public record RecoveryImageResult(bool Completed,string Message,long BytesCopied,int ReadErrors);
 
 public static class DiskRecoveryEngine {
  const uint GENERIC_READ=0x80000000,GENERIC_WRITE=0x40000000,FILE_SHARE_READ=1,FILE_SHARE_WRITE=2,OPEN_EXISTING=3;
  [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] static extern SafeFileHandle CreateFile(string name,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
+ static string RecoveryRoot { get { var p=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"RED RAM","Recovery");Directory.CreateDirectory(p);return p;} }
+ static string Sha(byte[] b)=>Convert.ToHexString(SHA256.HashData(b));
+ static void Journal(string drive,long offset,byte[] original,byte[] replacement,string operation,string backupPath){
+  var e=new RecoveryJournalEntry(DateTime.UtcNow,drive,offset,original.Length,Sha(original),Sha(replacement),operation,backupPath);
+  File.AppendAllText(Path.Combine(RecoveryRoot,"repair-journal.jsonl"),JsonSerializer.Serialize(e)+Environment.NewLine);
+ }
+ static long SafeLength(FileStream fs){try{return fs.Length;}catch{return 0;}}
+ public static List<PartitionCandidate> QuickScan(string drive,CancellationToken ct){
+  var r=new List<PartitionCandidate>();try{using var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);if(h.IsInvalid)return r;using var fs=new FileStream(h,FileAccess.Read,65536,false);var b=new byte[4096];ct.ThrowIfCancellationRequested();int n=fs.Read(b,0,b.Length);if(n>=512){var o=System.Text.Encoding.ASCII.GetString(b,3,8);if(o=="NTFS    ")r.Add(new("NTFS",0,SafeLength(fs),RecoveryConfidence.High,"Valid NTFS OEM signature at volume start."));else if(o.StartsWith("EXFAT"))r.Add(new("exFAT",0,SafeLength(fs),RecoveryConfidence.High,"Valid exFAT signature at volume start."));else if(System.Text.Encoding.ASCII.GetString(b,54,3)=="FAT"||System.Text.Encoding.ASCII.GetString(b,82,3)=="FAT")r.Add(new("FAT",0,SafeLength(fs),RecoveryConfidence.Medium,"FAT signature found at volume start."));}}catch{}return r;
+ }
+ public static async Task<RecoveryImageResult> CreateRecoveryImageAsync(string drive,string destination,IProgress<RecoveryProgress>? progress,CancellationToken ct){
+  var destRoot=Path.GetPathRoot(Path.GetFullPath(destination));if(string.Equals(destRoot,drive+"\\",StringComparison.OrdinalIgnoreCase))return new(false,"Destination cannot be the source volume.",0,0);
+  const int block=1024*1024;long done=0,total=0;int errors=0;try{
+   using var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);if(h.IsInvalid)return new(false,"Could not open source read-only.",0,0);
+   using var src=new FileStream(h,FileAccess.Read,block,false);total=SafeLength(src);if(total<=0)return new(false,"Windows did not expose a safe source length for imaging.",0,0);
+   Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(destination))!);using var dst=new FileStream(destination,FileMode.OpenOrCreate,FileAccess.Write,FileShare.Read,block,true);done=Math.Min(dst.Length,total);dst.Position=done;src.Position=done;var buf=new byte[block];
+   while(done<total){ct.ThrowIfCancellationRequested();int want=(int)Math.Min(buf.Length,total-done),n=0;try{n=await src.ReadAsync(buf.AsMemory(0,want),ct);}catch(IOException){errors++;src.Position=Math.Min(total,done+want);await dst.WriteAsync(new byte[want],ct);done+=want;progress?.Report(new(done,total,errors,"Imaging around unreadable region"));continue;}if(n<=0)break;await dst.WriteAsync(buf.AsMemory(0,n),ct);done+=n;progress?.Report(new(done,total,errors,"Creating recovery image"));}
+   await dst.FlushAsync(ct);return new(done>=total,$"Recovery image {(done>=total?"completed":"stopped")} with {errors} unreadable block(s).",done,errors);
+  }catch(OperationCanceledException){return new(false,"Imaging paused/cancelled safely. Existing image is resumable.",done,errors);}catch(Exception ex){return new(false,"Imaging stopped safely: "+ex.Message,done,errors);}
+ }
  static RawVolumeProbe ProbeRawVolume(string drive,List<string> evidence){try{using var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);if(h.IsInvalid){var msg="Native read-only volume open failed: "+new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message;evidence.Add(msg);return new(false,"Unknown","Unknown",msg);}using var fs=new FileStream(h,FileAccess.Read,4096,false);var b=new byte[4096];int n=fs.Read(b,0,b.Length);string hint="Unknown",style="Unknown";if(n>=512){if(b[510]==0x55&&b[511]==0xAA)style="MBR/boot signature present";var oem=System.Text.Encoding.ASCII.GetString(b,3,Math.Min(8,n-3)).Trim();if(oem.Contains("NTFS",StringComparison.OrdinalIgnoreCase))hint="NTFS";else if(oem.Contains("EXFAT",StringComparison.OrdinalIgnoreCase))hint="exFAT";else if(oem.Contains("FAT",StringComparison.OrdinalIgnoreCase))hint="FAT";evidence.Add($"Native read-only probe: {n} bytes read; filesystem hint {hint}; {style}.");}return new(true,hint,style,string.Join(Environment.NewLine,evidence));}catch(Exception ex){evidence.Add("Native read-only probe failed: "+ex.Message);return new(false,"Unknown","Unknown",ex.Message);}}
 
  static bool ValidNtfsBoot(byte[] b){
@@ -51,8 +77,8 @@ public static class DiskRecoveryEngine {
    var path=Path.Combine(dir,$"{drive.Replace(":","")}-boot-{DateTime.Now:yyyyMMdd-HHmmss}.bin");File.WriteAllBytes(path,original);
    using var wh=CreateFile(@"\\.\\"+drive,GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);
    if(wh.IsInvalid)return new(false,"Windows did not grant write access. Original metadata backup was preserved.");
-   using var ws=new FileStream(wh,FileAccess.ReadWrite,4096,false);ws.Position=0;ws.Write(backup,0,backup.Length);ws.Flush(true);
-   return new(true,$"Validated NTFS backup boot sector restored. Original metadata was saved to {path}. Reconnect the drive so Windows can remount it.");
+   using var ws=new FileStream(wh,FileAccess.ReadWrite,4096,false);ws.Position=0;ws.Write(backup,0,backup.Length);ws.Flush(true);ws.Position=0;var verify=new byte[backup.Length];if(ws.Read(verify,0,verify.Length)!=verify.Length||!verify.SequenceEqual(backup))return new(false,"Repair write could not be verified. Original metadata backup is preserved.");Journal(drive,0,original,backup,"Restore NTFS backup boot sector",path);
+   return new(true,$"Validated NTFS backup boot sector restored and verified. Original metadata was saved to {path}. Reconnect the drive so Windows can remount it.");
   }catch(Exception ex){return new(false,"Automatic validated repair stopped safely: "+ex.Message);}
  }
 
@@ -83,8 +109,8 @@ public static class DiskRecoveryEngine {
    using(var h=CreateFile(@"\\.\\"+drive,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero)){if(h.IsInvalid)return new(false,"Could not reopen volume.");using var fs=new FileStream(h,FileAccess.Read,4096,false);mirror=new byte[bytes];original=new byte[bytes];fs.Position=source;if(fs.Read(mirror,0,bytes)!=bytes)return new(false,"Could not re-read MFT mirror.");fs.Position=target;if(fs.Read(original,0,bytes)!=bytes)return new(false,"Could not preserve damaged MFT records.");}
    var dir=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"RED RAM","RecoveryBackups");Directory.CreateDirectory(dir);var path=Path.Combine(dir,$"{drive.Replace(":","")}-mft-{DateTime.Now:yyyyMMdd-HHmmss}.bin");File.WriteAllBytes(path,original);
    using var wh=CreateFile(@"\\.\\"+drive,GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,IntPtr.Zero,OPEN_EXISTING,0,IntPtr.Zero);if(wh.IsInvalid)return new(false,"Windows did not grant write access. MFT backup was preserved.");
-   using var ws=new FileStream(wh,FileAccess.ReadWrite,4096,false);ws.Position=target;ws.Write(mirror,0,mirror.Length);ws.Flush(true);
-   return new(true,$"Validated NTFS MFT mirror restored to the damaged system-record area. Original MFT bytes saved to {path}. Reconnect the drive and verify it before further writes.");
+   using var ws=new FileStream(wh,FileAccess.ReadWrite,4096,false);ws.Position=target;ws.Write(mirror,0,mirror.Length);ws.Flush(true);ws.Position=target;var verify=new byte[mirror.Length];if(ws.Read(verify,0,verify.Length)!=verify.Length||!verify.SequenceEqual(mirror))return new(false,"MFT repair write could not be verified. Original MFT backup is preserved.");Journal(drive,target,original,mirror,"Restore validated NTFS MFT mirror records",path);
+   return new(true,$"Validated NTFS MFT mirror restored and verified to the damaged system-record area. Original MFT bytes saved to {path}. Reconnect the drive and verify it before further writes.");
   }catch(Exception ex){return new(false,"Validated MFT repair stopped safely: "+ex.Message);}
  }
 
