@@ -1,5 +1,5 @@
 using System.Diagnostics;
-namespace RED RAM;
+namespace SmartRAM;
 public record PressureAssessment(int Score,string Level,string Workload,string Explanation);
 public record SmartRecommendation(string Action,double TargetGb,string Confidence,string Reason);
 public static class MemoryIntelligenceEngine{
