@@ -3,12 +3,12 @@ using System.Net.Http;
 using System.Reflection;
 using System.Text.Json;
 
-namespace SmartRAM;
+namespace RED RAM;
 
 public record UpdateCheckResult(bool UpdateAvailable,Version Current,Version? Latest,string Message,string? ReleaseUrl);
 
 public static class UpdateService {
- const string ReleasesApi="https://api.github.com/repos/aamitojj/smartram/releases/latest";
+ const string ReleasesApi="https://api.github.com/repos/amitogpandori/redram/releases/latest";
  static readonly HttpClient Client=CreateClient();
  static HttpClient CreateClient(){var c=new HttpClient{Timeout=TimeSpan.FromSeconds(8)};c.DefaultRequestHeaders.UserAgent.ParseAdd("RED-RAM-Windows-Updater/0.9");c.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");return c;}
  public static async Task<UpdateCheckResult> CheckAsync(CancellationToken ct=default){

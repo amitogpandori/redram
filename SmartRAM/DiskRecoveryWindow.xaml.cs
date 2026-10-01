@@ -1,5 +1,6 @@
 using System.Windows;
 namespace SmartRAM;
+using System.Text;
 public partial class DiskRecoveryWindow:Window{
  CancellationTokenSource? cts;DiskRecoveryAssessment? assessment;
  public DiskRecoveryWindow(){InitializeComponent();DriveBox.ItemsSource=DiskRecoveryEngine.CandidateDrives();if(DriveBox.Items.Count>0)DriveBox.SelectedIndex=0;}
@@ -18,7 +19,15 @@ public partial class DiskRecoveryWindow:Window{
    else Status.Text="Automatic diagnosis complete — unsafe writes were blocked.";
   }catch(OperationCanceledException){Status.Text="Recovery cancelled. No further disk changes were made.";}catch(Exception ex){Status.Text="Recovery stopped safely.";Output.Text=ex.Message;}finally{ScanButton.IsEnabled=true;CancelButton.IsEnabled=false;}
  }
- void Structure_Click(object s,RoutedEventArgs e){if(DriveBox.SelectedItem is not string drive)return;var r=DiskRecoveryEngine.InspectPartitionStructures(drive);Output.Text=r.Summary+"\n"+string.Join("\n",r.MbrPartitions.Select(p=>$"Entry {p.Index}: type 0x{p.Type:X2}, start LBA {p.StartLba}, sectors {p.SectorCount}, valid {p.Valid}"));Status.Text="Partition structures inspected read-only.";}
+ async void Structure_Click(object s,RoutedEventArgs e){
+  if(DriveBox.SelectedItem is not string drive)return;cts?.Cancel();cts=new();StructureButton.IsEnabled=false;CancelButton.IsEnabled=true;
+  try{
+   var basic=DiskRecoveryEngine.InspectPartitionStructures(drive);var gpt=AdvancedRecoveryEngine.InspectGpt(drive);var mbr=AdvancedRecoveryEngine.InspectMbr(drive);
+   Status.Text="Deep partition scan running read-only…";var progress=new Progress<RecoveryProgress>(p=>Status.Text=p.TotalBytes>0?$"Deep partition scan {p.BytesProcessed*100d/p.TotalBytes:F1}%":p.Stage);
+   var hits=await AdvancedRecoveryEngine.DeepPartitionScanAsync(drive,progress,cts.Token);
+   var sb=new StringBuilder();sb.AppendLine(basic.Summary);sb.AppendLine(gpt.Evidence);foreach(var p in mbr)sb.AppendLine($"MBR {p.Index}: type 0x{p.Type:X2}, start LBA {p.StartLba}, sectors {p.SectorCount}, bootable {p.Bootable}");foreach(var h in hits)sb.AppendLine($"Candidate: {h.FileSystem} at byte {h.Offset} · confidence {h.Score}% · {h.Evidence}");Output.Text=sb.ToString();Status.Text=$"Partition analysis complete · {hits.Count} filesystem candidate(s) · source unchanged.";
+  }catch(OperationCanceledException){Status.Text="Partition scan cancelled safely.";}finally{StructureButton.IsEnabled=true;CancelButton.IsEnabled=false;}
+ }
  void Files_Click(object s,RoutedEventArgs e){if(DriveBox.SelectedItem is not string drive)return;using var dlg=new System.Windows.Forms.FolderBrowserDialog{Description="Choose a DIFFERENT drive/folder for recovered files"};if(dlg.ShowDialog()!=System.Windows.Forms.DialogResult.OK)return;cts?.Cancel();cts=new();FilesButton.IsEnabled=false;CancelButton.IsEnabled=true;var p=new Progress<RecoveryProgress>(x=>Status.Text=x.TotalBytes>0?$"Deep recovery {x.BytesProcessed*100d/x.TotalBytes:F1}%":x.Stage);_=RunFilesAsync(drive,dlg.SelectedPath,p,cts.Token);}
  async Task RunFilesAsync(string drive,string dest,IProgress<RecoveryProgress> p,CancellationToken ct){try{var r=await DiskRecoveryEngine.DeepRecoverFilesAsync(drive,dest,p,ct);Output.Text=r.Message;Status.Text=r.Completed?"Deep recovery scan completed.":"Recovery stopped safely.";}finally{FilesButton.IsEnabled=true;CancelButton.IsEnabled=false;}}
  void Image_Click(object s,RoutedEventArgs e){
