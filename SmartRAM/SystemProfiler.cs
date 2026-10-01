@@ -2,7 +2,7 @@ using Microsoft.Win32;
 using System.IO;
 using System.Diagnostics;
 using System.Management;
-namespace RED RAM;
+namespace SmartRAM;
 public record PcProfile(string Cpu,string Windows,double RamGb,string DiskModel,string DiskKind,double DiskGb,double FreeGb,string PageFile,double PageFileGb,int LogicalCores,double FreePercent);
 public static class SystemProfiler {
  public static PcProfile Scan(){
