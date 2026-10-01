@@ -3,7 +3,7 @@ using System.Net.Http;
 using System.Reflection;
 using System.Text.Json;
 
-namespace RED RAM;
+namespace SmartRAM;
 
 public record UpdateCheckResult(bool UpdateAvailable,Version Current,Version? Latest,string Message,string? ReleaseUrl);
 
