@@ -10,7 +10,7 @@ public record UpdateCheckResult(bool UpdateAvailable,Version Current,Version? La
 public static class UpdateService {
  const string ReleasesApi="https://api.github.com/repos/amitogpandori/redram/releases/latest";
  static readonly HttpClient Client=CreateClient();
- static HttpClient CreateClient(){var c=new HttpClient{Timeout=TimeSpan.FromSeconds(8)};c.DefaultRequestHeaders.UserAgent.ParseAdd("RED-RAM-Windows-Updater/0.9");c.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");return c;}
+ static HttpClient CreateClient(){var c=new HttpClient{Timeout=TimeSpan.FromSeconds(8)};c.DefaultRequestHeaders.UserAgent.ParseAdd("RED-RAM-Windows-Updater/0.10");c.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");return c;}
  public static async Task<UpdateCheckResult> CheckAsync(CancellationToken ct=default){
   var current=Assembly.GetExecutingAssembly().GetName().Version??new Version(0,0);
   try{
