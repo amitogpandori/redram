@@ -1,5 +1,5 @@
 #define MyAppName "RED RAM"
-#define MyAppVersion "0.9.1"
+#define MyAppVersion "0.10.0"
 #define MyAppPublisher "RED RAM"
 #define MyAppExeName "RedRAM.exe"
 #define MyAppId "{CDE6B25E-3D9D-4A47-9E72-6F918B7A0D31}"
